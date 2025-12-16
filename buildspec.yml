@@ -302,12 +302,11 @@ phases:
           --stack-status-filter CREATE_FAILED UPDATE_FAILED ROLLBACK_COMPLETE UPDATE_ROLLBACK_COMPLETE \
           --query 'StackSummaries[?contains(StackName, `CrossAccount`)].StackName' \
           --output text)
-        
         if [ ! -z "$FAILED_STACKS" ]; then
-          echo "⚠️  WARNING: Some stacks may have failed:"
+          echo "WARNING: Some stacks may have failed:"
           echo "$FAILED_STACKS"
         else
-          echo "✓ All stacks deployed successfully"
+          echo "All stacks deployed successfully"
         fi
       
       # Save deployment logs
@@ -315,20 +314,16 @@ phases:
       - tar -czf deployment-logs.tar.gz deployment-logs/
       
       # Generate deployment report
+      - echo "Generating deployment report..."
       - |
-        cat > deployment-report.json << EOF
+        cat > deployment-report.json << 'EOF'
         {
           "deploymentTime": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
           "sourceAccount": "$AWS_ACCOUNT_ID",
           "targetAccount": "$TARGET_ACCOUNT_ID",
           "environment": "$ENVIRONMENT",
           "region": "$AWS_DEFAULT_REGION",
-          "deployedStacks": [
-        $(aws cloudformation list-stacks \
-          --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE \
-          --query 'StackSummaries[?contains(StackName, `CrossAccount`)].{name:StackName,status:StackStatus,created:CreationTime}' \
-          --output json | jq -c '.[]' | sed 's/$/,/' | sed '$ s/,$//')
-          ]
+          "status": "completed"
         }
         EOF
       

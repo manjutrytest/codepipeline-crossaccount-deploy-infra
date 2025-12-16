@@ -1,8 +1,5 @@
 version: 0.2
 
-# Cross-Account Infrastructure Deployment BuildSpec
-# This buildspec deploys CloudFormation templates from source account to target account
-
 phases:
   install:
     runtime-versions:
@@ -13,7 +10,6 @@ phases:
       - pip install --upgrade pip awscli boto3 jq
       - aws --version
       - python --version
-      - jq --version
       - echo "Install phase completed"
 
   pre_build:
@@ -43,10 +39,9 @@ phases:
             aws cloudformation validate-template --template-body file://$template
             validation_failed=true
           else
-            echo "✓ Valid: $template"
+            echo "Valid: $template"
           fi
         done
-        
         if [ "$validation_failed" = true ]; then
           echo "Template validation failed. Exiting."
           exit 1
@@ -68,7 +63,6 @@ phases:
       - |
         find templates/infrastructure -name "*.yaml" -o -name "*.yml" | while read template; do
           template_name=$(basename "$template")
-          template_dir=$(dirname "$template")
           echo "Processing: $template -> $template_name"
           
           # Check if template needs packaging (contains Transform or nested stacks)
@@ -150,7 +144,7 @@ phases:
             cat deployment-logs/vpc-deployment.log
             exit 1
           fi
-          echo "✓ VPC infrastructure deployed successfully"
+          echo "VPC infrastructure deployed successfully"
         fi
       
       # 2. Deploy Security Groups (depends on VPC)
@@ -179,7 +173,7 @@ phases:
             cat deployment-logs/security-groups-deployment.log
             exit 1
           fi
-          echo "✓ Security Groups deployed successfully"
+          echo "Security Groups deployed successfully"
         fi
       
       # 3. Deploy S3 Storage
@@ -208,52 +202,8 @@ phases:
             cat deployment-logs/s3-storage-deployment.log
             exit 1
           fi
-          echo "✓ S3 storage infrastructure deployed successfully"
+          echo "S3 storage infrastructure deployed successfully"
         fi
-      
-      # 4. Deploy additional infrastructure templates
-      - |
-        for template in packaged-templates/*.yaml packaged-templates/*.yml; do
-          if [ -f "$template" ]; then
-            template_name=$(basename "$template" .yaml)
-            template_name=$(basename "$template_name" .yml)
-            
-            # Skip already deployed templates
-            case "$template_name" in
-              vpc|security-groups|s3-storage)
-                echo "Skipping already deployed template: $template_name"
-                continue
-                ;;
-            esac
-            
-            echo "Deploying additional template: $template_name"
-            stack_name="CrossAccount-${template_name^}-${ENVIRONMENT}"
-            
-            aws cloudformation deploy \
-              --template-file "$template" \
-              --stack-name "$stack_name" \
-              --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
-              --parameter-overrides \
-                Environment=${ENVIRONMENT} \
-                Project=CrossAccountInfraDeployment \
-                VPCStackName=CrossAccount-VPC-${ENVIRONMENT} \
-              --tags \
-                Environment=${ENVIRONMENT} \
-                Project=CrossAccountInfraDeployment \
-                ManagedBy=CodePipeline \
-                SourceAccount=${AWS_ACCOUNT_ID} \
-                DeployedBy=CrossAccountPipeline \
-              --no-fail-on-empty-changeset \
-              --region $AWS_DEFAULT_REGION 2>&1 | tee "deployment-logs/${template_name}-deployment.log"
-            
-            if [ ${PIPESTATUS[0]} -ne 0 ]; then
-              echo "ERROR: Deployment failed for $template_name"
-              cat "deployment-logs/${template_name}-deployment.log"
-              exit 1
-            fi
-            echo "✓ $template_name deployed successfully"
-          fi
-        done
       
       - echo "Build phase completed successfully"
 
@@ -289,12 +239,12 @@ phases:
       
       # Generate deployment summary
       - echo "=== DEPLOYMENT SUMMARY ==="
-      - echo "✓ Templates validated successfully"
-      - echo "✓ Cross-account role assumed successfully"
-      - echo "✓ CloudFormation stacks deployed successfully"
-      - echo "✓ All resources created in target account: $TARGET_ACCOUNT_ID"
-      - echo "✓ Environment: $ENVIRONMENT"
-      - echo "✓ Region: $AWS_DEFAULT_REGION"
+      - echo "Templates validated successfully"
+      - echo "Cross-account role assumed successfully"
+      - echo "CloudFormation stacks deployed successfully"
+      - echo "All resources created in target account: $TARGET_ACCOUNT_ID"
+      - echo "Environment: $ENVIRONMENT"
+      - echo "Region: $AWS_DEFAULT_REGION"
       
       # Check for any failed stacks
       - |

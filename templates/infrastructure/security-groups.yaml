@@ -1,0 +1,486 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Security Groups for cross-account infrastructure deployment'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: 'production'
+    AllowedValues: ['development', 'staging', 'production']
+    Description: 'Environment name'
+    
+  Project:
+    Type: String
+    Default: 'CrossAccountInfraDeployment'
+    Description: 'Project name for resource tagging'
+    
+  VPCStackName:
+    Type: String
+    Default: 'CrossAccount-VPC-production'
+    Description: 'Name of the VPC CloudFormation stack'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Configuration"
+        Parameters:
+          - Environment
+          - Project
+          - VPCStackName
+
+Resources:
+  # Application Load Balancer Security Group
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${Project}-${Environment}-ALB-SG'
+      GroupDescription: 'Security group for Application Load Balancer'
+      VpcId:
+        Fn::ImportValue: !Sub '${VPCStackName}-VPC-ID'
+      SecurityGroupIngress:
+        # HTTP from internet
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: 'HTTP from internet'
+        # HTTPS from internet
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: 'HTTPS from internet'
+      SecurityGroupEgress:
+        # All outbound traffic (will be restricted by target security groups)
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: 'All outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${Project}-${Environment}-ALB-SG'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: Purpose
+          Value: LoadBalancer
+
+  # Web Application Security Group
+  WebAppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${Project}-${Environment}-WebApp-SG'
+      GroupDescription: 'Security group for web application servers'
+      VpcId:
+        Fn::ImportValue: !Sub '${VPCStackName}-VPC-ID'
+      SecurityGroupIngress:
+        # HTTP from ALB
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: 'HTTP from Application Load Balancer'
+        # HTTPS from ALB
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: 'HTTPS from Application Load Balancer'
+        # Custom application port from ALB
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: 'Custom app port from ALB'
+        # SSH from Bastion Host
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref BastionSecurityGroup
+          Description: 'SSH from Bastion Host'
+      SecurityGroupEgress:
+        # HTTPS to internet (for package updates, API calls)
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: 'HTTPS to internet'
+        # HTTP to internet (for package updates)
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: 'HTTP to internet'
+        # DNS
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: 0.0.0.0/0
+          Description: 'DNS resolution'
+        # NTP
+        - IpProtocol: udp
+          FromPort: 123
+          ToPort: 123
+          CidrIp: 0.0.0.0/0
+          Description: 'NTP time synchronization'
+      Tags:
+        - Key: Name
+          Value: !Sub '${Project}-${Environment}-WebApp-SG'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: Purpose
+          Value: WebApplication
+
+  # Database Security Group
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${Project}-${Environment}-Database-SG'
+      GroupDescription: 'Security group for database servers'
+      VpcId:
+        Fn::ImportValue: !Sub '${VPCStackName}-VPC-ID'
+      SecurityGroupIngress:
+        # MySQL/Aurora from web application
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref WebAppSecurityGroup
+          Description: 'MySQL/Aurora from web application'
+        # PostgreSQL from web application
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref WebAppSecurityGroup
+          Description: 'PostgreSQL from web application'
+        # MySQL/Aurora from bastion host (for admin access)
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref BastionSecurityGroup
+          Description: 'MySQL/Aurora from bastion host'
+        # PostgreSQL from bastion host (for admin access)
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref BastionSecurityGroup
+          Description: 'PostgreSQL from bastion host'
+      # No outbound rules needed for database
+      Tags:
+        - Key: Name
+          Value: !Sub '${Project}-${Environment}-Database-SG'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: Purpose
+          Value: Database
+
+  # Bastion Host Security Group
+  BastionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${Project}-${Environment}-Bastion-SG'
+      GroupDescription: 'Security group for bastion host'
+      VpcId:
+        Fn::ImportValue: !Sub '${VPCStackName}-VPC-ID'
+      SecurityGroupIngress:
+        # SSH from specific IP ranges (replace with your office/VPN IPs)
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 203.0.113.0/24  # Replace with your office IP range
+          Description: 'SSH from office network'
+        # Alternative: SSH from anywhere (less secure, use with caution in non-prod)
+        # Uncomment the following for development environments
+        # - IpProtocol: tcp
+        #   FromPort: 22
+        #   ToPort: 22
+        #   CidrIp: 0.0.0.0/0
+        #   Description: 'SSH from anywhere (DEV ONLY)'
+      SecurityGroupEgress:
+        # SSH to web application servers
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref WebAppSecurityGroup
+          Description: 'SSH to web application servers'
+        # Database access for administration
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref DatabaseSecurityGroup
+          Description: 'MySQL/Aurora to database'
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref DatabaseSecurityGroup
+          Description: 'PostgreSQL to database'
+        # HTTPS for package updates and AWS API calls
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: 'HTTPS to internet'
+        # HTTP for package updates
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: 'HTTP to internet'
+        # DNS
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: 0.0.0.0/0
+          Description: 'DNS resolution'
+        # NTP
+        - IpProtocol: udp
+          FromPort: 123
+          ToPort: 123
+          CidrIp: 0.0.0.0/0
+          Description: 'NTP time synchronization'
+      Tags:
+        - Key: Name
+          Value: !Sub '${Project}-${Environment}-Bastion-SG'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: Purpose
+          Value: BastionHost
+
+  # Cache/Redis Security Group
+  CacheSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${Project}-${Environment}-Cache-SG'
+      GroupDescription: 'Security group for cache servers (Redis/ElastiCache)'
+      VpcId:
+        Fn::ImportValue: !Sub '${VPCStackName}-VPC-ID'
+      SecurityGroupIngress:
+        # Redis from web application
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref WebAppSecurityGroup
+          Description: 'Redis from web application'
+        # Memcached from web application
+        - IpProtocol: tcp
+          FromPort: 11211
+          ToPort: 11211
+          SourceSecurityGroupId: !Ref WebAppSecurityGroup
+          Description: 'Memcached from web application'
+        # Redis from bastion for debugging
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref BastionSecurityGroup
+          Description: 'Redis from bastion host'
+      # No outbound rules needed for cache
+      Tags:
+        - Key: Name
+          Value: !Sub '${Project}-${Environment}-Cache-SG'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: Purpose
+          Value: Cache
+
+  # EFS Security Group
+  EFSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${Project}-${Environment}-EFS-SG'
+      GroupDescription: 'Security group for EFS file system'
+      VpcId:
+        Fn::ImportValue: !Sub '${VPCStackName}-VPC-ID'
+      SecurityGroupIngress:
+        # NFS from web application servers
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref WebAppSecurityGroup
+          Description: 'NFS from web application servers'
+        # NFS from bastion host (for admin access)
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref BastionSecurityGroup
+          Description: 'NFS from bastion host'
+      # No outbound rules needed for EFS
+      Tags:
+        - Key: Name
+          Value: !Sub '${Project}-${Environment}-EFS-SG'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: Purpose
+          Value: FileSystem
+
+  # Lambda Security Group
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${Project}-${Environment}-Lambda-SG'
+      GroupDescription: 'Security group for Lambda functions in VPC'
+      VpcId:
+        Fn::ImportValue: !Sub '${VPCStackName}-VPC-ID'
+      SecurityGroupEgress:
+        # HTTPS for AWS API calls
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: 'HTTPS for AWS API calls'
+        # Database access
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref DatabaseSecurityGroup
+          Description: 'MySQL/Aurora access'
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref DatabaseSecurityGroup
+          Description: 'PostgreSQL access'
+        # Cache access
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref CacheSecurityGroup
+          Description: 'Redis access'
+        # DNS
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: 0.0.0.0/0
+          Description: 'DNS resolution'
+      Tags:
+        - Key: Name
+          Value: !Sub '${Project}-${Environment}-Lambda-SG'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: Purpose
+          Value: Lambda
+
+  # ECS/Fargate Security Group
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${Project}-${Environment}-ECS-SG'
+      GroupDescription: 'Security group for ECS/Fargate tasks'
+      VpcId:
+        Fn::ImportValue: !Sub '${VPCStackName}-VPC-ID'
+      SecurityGroupIngress:
+        # HTTP from ALB
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: 'HTTP from ALB'
+        # Custom application ports from ALB
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8999
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: 'Custom app ports from ALB'
+      SecurityGroupEgress:
+        # HTTPS for AWS API calls and external services
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: 'HTTPS to internet'
+        # HTTP for external services
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: 'HTTP to internet'
+        # Database access
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref DatabaseSecurityGroup
+          Description: 'MySQL/Aurora access'
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref DatabaseSecurityGroup
+          Description: 'PostgreSQL access'
+        # Cache access
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref CacheSecurityGroup
+          Description: 'Redis access'
+        # DNS
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: 0.0.0.0/0
+          Description: 'DNS resolution'
+      Tags:
+        - Key: Name
+          Value: !Sub '${Project}-${Environment}-ECS-SG'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: Purpose
+          Value: ECS
+
+Outputs:
+  ALBSecurityGroupId:
+    Description: 'ID of the Application Load Balancer security group'
+    Value: !Ref ALBSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ALB-SG'
+
+  WebAppSecurityGroupId:
+    Description: 'ID of the web application security group'
+    Value: !Ref WebAppSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-WebApp-SG'
+
+  DatabaseSecurityGroupId:
+    Description: 'ID of the database security group'
+    Value: !Ref DatabaseSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-Database-SG'
+
+  BastionSecurityGroupId:
+    Description: 'ID of the bastion host security group'
+    Value: !Ref BastionSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-Bastion-SG'
+
+  CacheSecurityGroupId:
+    Description: 'ID of the cache security group'
+    Value: !Ref CacheSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-Cache-SG'
+
+  EFSSecurityGroupId:
+    Description: 'ID of the EFS security group'
+    Value: !Ref EFSSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-EFS-SG'
+
+  LambdaSecurityGroupId:
+    Description: 'ID of the Lambda security group'
+    Value: !Ref LambdaSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-Lambda-SG'
+
+  ECSSecurityGroupId:
+    Description: 'ID of the ECS security group'
+    Value: !Ref ECSSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ECS-SG'

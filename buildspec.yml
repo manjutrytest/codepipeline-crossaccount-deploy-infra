@@ -1,0 +1,347 @@
+version: 0.2
+
+# Cross-Account Infrastructure Deployment BuildSpec
+# This buildspec deploys CloudFormation templates from source account to target account
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.9
+    commands:
+      - echo "=== INSTALL PHASE ==="
+      - echo "Installing dependencies..."
+      - pip install --upgrade pip awscli boto3 jq
+      - aws --version
+      - python --version
+      - jq --version
+      - echo "Install phase completed"
+
+  pre_build:
+    commands:
+      - echo "=== PRE-BUILD PHASE ==="
+      - echo "Build started on $(date)"
+      - echo "Source Account ID:" $AWS_ACCOUNT_ID
+      - echo "Target Account ID:" $TARGET_ACCOUNT_ID
+      - echo "Cross Account Role:" $CROSS_ACCOUNT_ROLE_NAME
+      - echo "External ID:" $EXTERNAL_ID
+      - echo "Environment:" $ENVIRONMENT
+      - echo "Region:" $AWS_DEFAULT_REGION
+      - echo "Artifacts Bucket:" $ARTIFACTS_BUCKET
+      
+      # List available CloudFormation templates
+      - echo "Available CloudFormation templates:"
+      - find templates/infrastructure -name "*.yaml" -o -name "*.yml" | head -20
+      
+      # Validate CloudFormation templates
+      - echo "Validating CloudFormation templates..."
+      - |
+        validation_failed=false
+        find templates/infrastructure -name "*.yaml" -o -name "*.yml" | while read template; do
+          echo "Validating: $template"
+          if ! aws cloudformation validate-template --template-body file://$template > /dev/null 2>&1; then
+            echo "ERROR: Template validation failed for $template"
+            aws cloudformation validate-template --template-body file://$template
+            validation_failed=true
+          else
+            echo "✓ Valid: $template"
+          fi
+        done
+        
+        if [ "$validation_failed" = true ]; then
+          echo "Template validation failed. Exiting."
+          exit 1
+        fi
+      
+      - echo "All templates validated successfully"
+      - echo "Pre-build phase completed"
+
+  build:
+    commands:
+      - echo "=== BUILD PHASE ==="
+      
+      # Create directories for packaged templates and logs
+      - mkdir -p packaged-templates
+      - mkdir -p deployment-logs
+      
+      # Package CloudFormation templates
+      - echo "Packaging CloudFormation templates..."
+      - |
+        find templates/infrastructure -name "*.yaml" -o -name "*.yml" | while read template; do
+          template_name=$(basename "$template")
+          template_dir=$(dirname "$template")
+          echo "Processing: $template -> $template_name"
+          
+          # Check if template needs packaging (contains Transform or nested stacks)
+          if grep -q -E "(Transform:|AWS::CloudFormation::Stack)" "$template"; then
+            echo "Packaging $template (contains transforms or nested stacks)"
+            aws cloudformation package \
+              --template-file "$template" \
+              --s3-bucket $ARTIFACTS_BUCKET \
+              --s3-prefix "cloudformation-packages/$(date +%Y%m%d-%H%M%S)" \
+              --output-template-file "packaged-templates/$template_name" \
+              --force-upload
+          else
+            echo "Copying $template (no packaging needed)"
+            cp "$template" "packaged-templates/$template_name"
+          fi
+        done
+      
+      # List packaged templates
+      - echo "Packaged templates:"
+      - ls -la packaged-templates/
+      
+      # Assume cross-account role
+      - echo "Assuming cross-account deployment role..."
+      - |
+        CROSS_ACCOUNT_ROLE_ARN="arn:aws:iam::${TARGET_ACCOUNT_ID}:role/${CROSS_ACCOUNT_ROLE_NAME}"
+        echo "Role ARN: $CROSS_ACCOUNT_ROLE_ARN"
+        
+        # Assume role with external ID for additional security
+        TEMP_ROLE=$(aws sts assume-role \
+          --role-arn $CROSS_ACCOUNT_ROLE_ARN \
+          --role-session-name "CrossAccount-Infra-Deploy-$(date +%s)" \
+          --external-id $EXTERNAL_ID \
+          --duration-seconds 3600)
+        
+        if [ $? -ne 0 ]; then
+          echo "ERROR: Failed to assume cross-account role"
+          exit 1
+        fi
+        
+        # Export temporary credentials
+        export AWS_ACCESS_KEY_ID=$(echo $TEMP_ROLE | jq -r '.Credentials.AccessKeyId')
+        export AWS_SECRET_ACCESS_KEY=$(echo $TEMP_ROLE | jq -r '.Credentials.SecretAccessKey')
+        export AWS_SESSION_TOKEN=$(echo $TEMP_ROLE | jq -r '.Credentials.SessionToken')
+        
+        # Verify credentials
+        echo "Verifying assumed role identity..."
+        aws sts get-caller-identity
+        
+        if [ $? -ne 0 ]; then
+          echo "ERROR: Failed to verify assumed role"
+          exit 1
+        fi
+      
+      # Deploy CloudFormation stacks in dependency order
+      - echo "Deploying CloudFormation stacks to target account..."
+      
+      # 1. Deploy VPC infrastructure first (foundational)
+      - |
+        if [ -f "packaged-templates/vpc.yaml" ]; then
+          echo "Deploying VPC infrastructure..."
+          aws cloudformation deploy \
+            --template-file packaged-templates/vpc.yaml \
+            --stack-name CrossAccount-VPC-${ENVIRONMENT} \
+            --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+            --parameter-overrides \
+              Environment=${ENVIRONMENT} \
+              Project=CrossAccountInfraDeployment \
+            --tags \
+              Environment=${ENVIRONMENT} \
+              Project=CrossAccountInfraDeployment \
+              ManagedBy=CodePipeline \
+              SourceAccount=${AWS_ACCOUNT_ID} \
+              DeployedBy=CrossAccountPipeline \
+            --no-fail-on-empty-changeset \
+            --region $AWS_DEFAULT_REGION 2>&1 | tee deployment-logs/vpc-deployment.log
+          
+          if [ ${PIPESTATUS[0]} -ne 0 ]; then
+            echo "ERROR: VPC deployment failed"
+            cat deployment-logs/vpc-deployment.log
+            exit 1
+          fi
+          echo "✓ VPC infrastructure deployed successfully"
+        fi
+      
+      # 2. Deploy Security Groups (depends on VPC)
+      - |
+        if [ -f "packaged-templates/security-groups.yaml" ]; then
+          echo "Deploying Security Groups..."
+          aws cloudformation deploy \
+            --template-file packaged-templates/security-groups.yaml \
+            --stack-name CrossAccount-SecurityGroups-${ENVIRONMENT} \
+            --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+            --parameter-overrides \
+              Environment=${ENVIRONMENT} \
+              Project=CrossAccountInfraDeployment \
+              VPCStackName=CrossAccount-VPC-${ENVIRONMENT} \
+            --tags \
+              Environment=${ENVIRONMENT} \
+              Project=CrossAccountInfraDeployment \
+              ManagedBy=CodePipeline \
+              SourceAccount=${AWS_ACCOUNT_ID} \
+              DeployedBy=CrossAccountPipeline \
+            --no-fail-on-empty-changeset \
+            --region $AWS_DEFAULT_REGION 2>&1 | tee deployment-logs/security-groups-deployment.log
+          
+          if [ ${PIPESTATUS[0]} -ne 0 ]; then
+            echo "ERROR: Security Groups deployment failed"
+            cat deployment-logs/security-groups-deployment.log
+            exit 1
+          fi
+          echo "✓ Security Groups deployed successfully"
+        fi
+      
+      # 3. Deploy S3 Storage
+      - |
+        if [ -f "packaged-templates/s3-storage.yaml" ]; then
+          echo "Deploying S3 storage infrastructure..."
+          aws cloudformation deploy \
+            --template-file packaged-templates/s3-storage.yaml \
+            --stack-name CrossAccount-S3Storage-${ENVIRONMENT} \
+            --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+            --parameter-overrides \
+              Environment=${ENVIRONMENT} \
+              Project=CrossAccountInfraDeployment \
+              VPCStackName=CrossAccount-VPC-${ENVIRONMENT} \
+            --tags \
+              Environment=${ENVIRONMENT} \
+              Project=CrossAccountInfraDeployment \
+              ManagedBy=CodePipeline \
+              SourceAccount=${AWS_ACCOUNT_ID} \
+              DeployedBy=CrossAccountPipeline \
+            --no-fail-on-empty-changeset \
+            --region $AWS_DEFAULT_REGION 2>&1 | tee deployment-logs/s3-storage-deployment.log
+          
+          if [ ${PIPESTATUS[0]} -ne 0 ]; then
+            echo "ERROR: S3 storage deployment failed"
+            cat deployment-logs/s3-storage-deployment.log
+            exit 1
+          fi
+          echo "✓ S3 storage infrastructure deployed successfully"
+        fi
+      
+      # 4. Deploy additional infrastructure templates
+      - |
+        for template in packaged-templates/*.yaml packaged-templates/*.yml; do
+          if [ -f "$template" ]; then
+            template_name=$(basename "$template" .yaml)
+            template_name=$(basename "$template_name" .yml)
+            
+            # Skip already deployed templates
+            case "$template_name" in
+              vpc|security-groups|s3-storage)
+                echo "Skipping already deployed template: $template_name"
+                continue
+                ;;
+            esac
+            
+            echo "Deploying additional template: $template_name"
+            stack_name="CrossAccount-${template_name^}-${ENVIRONMENT}"
+            
+            aws cloudformation deploy \
+              --template-file "$template" \
+              --stack-name "$stack_name" \
+              --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+              --parameter-overrides \
+                Environment=${ENVIRONMENT} \
+                Project=CrossAccountInfraDeployment \
+                VPCStackName=CrossAccount-VPC-${ENVIRONMENT} \
+              --tags \
+                Environment=${ENVIRONMENT} \
+                Project=CrossAccountInfraDeployment \
+                ManagedBy=CodePipeline \
+                SourceAccount=${AWS_ACCOUNT_ID} \
+                DeployedBy=CrossAccountPipeline \
+              --no-fail-on-empty-changeset \
+              --region $AWS_DEFAULT_REGION 2>&1 | tee "deployment-logs/${template_name}-deployment.log"
+            
+            if [ ${PIPESTATUS[0]} -ne 0 ]; then
+              echo "ERROR: Deployment failed for $template_name"
+              cat "deployment-logs/${template_name}-deployment.log"
+              exit 1
+            fi
+            echo "✓ $template_name deployed successfully"
+          fi
+        done
+      
+      - echo "Build phase completed successfully"
+
+  post_build:
+    commands:
+      - echo "=== POST-BUILD PHASE ==="
+      - echo "Deployment completed on $(date)"
+      
+      # List all deployed stacks
+      - echo "Listing deployed stacks in target account..."
+      - |
+        aws cloudformation list-stacks \
+          --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE \
+          --query 'StackSummaries[?contains(StackName, `CrossAccount`)].{Name:StackName,Status:StackStatus,Created:CreationTime}' \
+          --output table
+      
+      # Get stack outputs for all deployed stacks
+      - echo "Getting stack outputs..."
+      - |
+        aws cloudformation list-stacks \
+          --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE \
+          --query 'StackSummaries[?contains(StackName, `CrossAccount`)].StackName' \
+          --output text | tr '\t' '\n' | while read stack; do
+            if [ ! -z "$stack" ]; then
+              echo "=== Outputs for $stack ==="
+              aws cloudformation describe-stacks \
+                --stack-name "$stack" \
+                --query 'Stacks[0].Outputs' \
+                --output table 2>/dev/null || echo "No outputs for $stack"
+              echo ""
+            fi
+          done
+      
+      # Generate deployment summary
+      - echo "=== DEPLOYMENT SUMMARY ==="
+      - echo "✓ Templates validated successfully"
+      - echo "✓ Cross-account role assumed successfully"
+      - echo "✓ CloudFormation stacks deployed successfully"
+      - echo "✓ All resources created in target account: $TARGET_ACCOUNT_ID"
+      - echo "✓ Environment: $ENVIRONMENT"
+      - echo "✓ Region: $AWS_DEFAULT_REGION"
+      
+      # Check for any failed stacks
+      - |
+        FAILED_STACKS=$(aws cloudformation list-stacks \
+          --stack-status-filter CREATE_FAILED UPDATE_FAILED ROLLBACK_COMPLETE UPDATE_ROLLBACK_COMPLETE \
+          --query 'StackSummaries[?contains(StackName, `CrossAccount`)].StackName' \
+          --output text)
+        
+        if [ ! -z "$FAILED_STACKS" ]; then
+          echo "⚠️  WARNING: Some stacks may have failed:"
+          echo "$FAILED_STACKS"
+        else
+          echo "✓ All stacks deployed successfully"
+        fi
+      
+      # Save deployment logs
+      - echo "Saving deployment logs to artifacts..."
+      - tar -czf deployment-logs.tar.gz deployment-logs/
+      
+      # Generate deployment report
+      - |
+        cat > deployment-report.json << EOF
+        {
+          "deploymentTime": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+          "sourceAccount": "$AWS_ACCOUNT_ID",
+          "targetAccount": "$TARGET_ACCOUNT_ID",
+          "environment": "$ENVIRONMENT",
+          "region": "$AWS_DEFAULT_REGION",
+          "deployedStacks": [
+        $(aws cloudformation list-stacks \
+          --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE \
+          --query 'StackSummaries[?contains(StackName, `CrossAccount`)].{name:StackName,status:StackStatus,created:CreationTime}' \
+          --output json | jq -c '.[]' | sed 's/$/,/' | sed '$ s/,$//')
+          ]
+        }
+        EOF
+      
+      - echo "Post-build phase completed"
+
+artifacts:
+  files:
+    - 'packaged-templates/**/*'
+    - 'deployment-logs.tar.gz'
+    - 'deployment-logs/**/*'
+    - 'deployment-report.json'
+  name: CrossAccountInfraDeploymentArtifacts
+
+cache:
+  paths:
+    - '/root/.cache/pip/**/*'

@@ -1,0 +1,548 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Cross-account CodePipeline for infrastructure deployment'
+
+Parameters:
+  GitHubRepoOwner:
+    Type: String
+    Default: 'manjutrytest'
+    Description: 'GitHub repository owner/organization'
+    
+  GitHubRepoName:
+    Type: String
+    Default: 'codepipeline-crossaccount-deploy-infra'
+    Description: 'GitHub repository name'
+    
+  GitHubBranch:
+    Type: String
+    Default: 'main'
+    Description: 'GitHub branch to monitor for changes'
+    
+  GitHubToken:
+    Type: String
+    NoEcho: true
+    Description: 'GitHub personal access token for repository access'
+    
+  TargetAccountId:
+    Type: String
+    Description: 'Target AWS account ID where infrastructure will be deployed'
+    AllowedPattern: '[0-9]{12}'
+    ConstraintDescription: 'Must be a valid 12-digit AWS Account ID'
+    
+  CrossAccountRoleName:
+    Type: String
+    Default: 'CrossAccountInfraDeploymentRole'
+    Description: 'Name of the cross-account deployment role in target account'
+    
+  ExternalId:
+    Type: String
+    Default: 'cross-account-infra-deploy-2024'
+    Description: 'External ID for cross-account role assumption'
+    NoEcho: true
+    
+  Environment:
+    Type: String
+    Default: 'production'
+    AllowedValues: ['development', 'staging', 'production']
+    Description: 'Environment name for resource tagging and configuration'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "GitHub Configuration"
+        Parameters:
+          - GitHubRepoOwner
+          - GitHubRepoName
+          - GitHubBranch
+          - GitHubToken
+      - Label:
+          default: "Cross-Account Configuration"
+        Parameters:
+          - TargetAccountId
+          - CrossAccountRoleName
+          - ExternalId
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - Environment
+
+Resources:
+  # S3 bucket for pipeline artifacts
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'cross-account-pipeline-artifacts-${AWS::AccountId}-${AWS::Region}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldArtifacts
+            Status: Enabled
+            ExpirationInDays: 30
+            NoncurrentVersionExpirationInDays: 7
+          - Id: AbortIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+      Tags:
+        - Key: Purpose
+          Value: PipelineArtifacts
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: CrossAccountInfraDeployment
+
+  # CodeBuild service role
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'CrossAccount-CodeBuild-ServiceRole-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/CloudWatchLogsFullAccess'
+      Policies:
+        - PolicyName: CodeBuildCrossAccountPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # S3 permissions for artifacts
+              - Effect: Allow
+                Action:
+                  - 's3:GetBucketVersioning'
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                  - 's3:PutObject'
+                  - 's3:ListBucket'
+                Resource:
+                  - !Sub '${ArtifactsBucket}'
+                  - !Sub '${ArtifactsBucket}/*'
+              
+              # Cross-account role assumption
+              - Effect: Allow
+                Action:
+                  - 'sts:AssumeRole'
+                Resource: !Sub 'arn:aws:iam::${TargetAccountId}:role/${CrossAccountRoleName}'
+              
+              # CloudFormation validation (local)
+              - Effect: Allow
+                Action:
+                  - 'cloudformation:ValidateTemplate'
+                  - 'cloudformation:EstimateTemplateCost'
+                Resource: '*'
+              
+              # CloudWatch Logs
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+
+  # CodeBuild project
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub 'cross-account-infra-deployment-${Environment}'
+      Description: 'Build project for cross-account infrastructure deployment'
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: 'aws/codebuild/amazonlinux2-x86_64-standard:5.0'
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: TARGET_ACCOUNT_ID
+            Value: !Ref TargetAccountId
+            Type: PLAINTEXT
+          - Name: CROSS_ACCOUNT_ROLE_NAME
+            Value: !Ref CrossAccountRoleName
+            Type: PLAINTEXT
+          - Name: EXTERNAL_ID
+            Value: !Ref ExternalId
+            Type: PLAINTEXT
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref 'AWS::Region'
+            Type: PLAINTEXT
+          - Name: ARTIFACTS_BUCKET
+            Value: !Ref ArtifactsBucket
+            Type: PLAINTEXT
+          - Name: ENVIRONMENT
+            Value: !Ref Environment
+            Type: PLAINTEXT
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                python: 3.9
+              commands:
+                - echo "Installing dependencies..."
+                - pip install --upgrade pip awscli boto3
+                - aws --version
+            
+            pre_build:
+              commands:
+                - echo "=== PRE-BUILD PHASE ==="
+                - echo "Build started on $(date)"
+                - echo "Source Account ID:" $AWS_ACCOUNT_ID
+                - echo "Target Account ID:" $TARGET_ACCOUNT_ID
+                - echo "Cross Account Role:" $CROSS_ACCOUNT_ROLE_NAME
+                - echo "Environment:" $ENVIRONMENT
+                - echo "Region:" $AWS_DEFAULT_REGION
+                
+                # Validate CloudFormation templates
+                - echo "Validating CloudFormation templates..."
+                - |
+                  find templates/infrastructure -name "*.yaml" -o -name "*.yml" | while read template; do
+                    echo "Validating: $template"
+                    aws cloudformation validate-template --template-body file://$template
+                  done
+            
+            build:
+              commands:
+                - echo "=== BUILD PHASE ==="
+                
+                # Create packaged templates directory
+                - mkdir -p packaged-templates
+                
+                # Package CloudFormation templates
+                - echo "Packaging CloudFormation templates..."
+                - |
+                  find templates/infrastructure -name "*.yaml" -o -name "*.yml" | while read template; do
+                    template_name=$(basename "$template")
+                    echo "Processing: $template -> $template_name"
+                    
+                    if grep -q -E "(Transform:|AWS::CloudFormation::Stack)" "$template"; then
+                      echo "Packaging $template (contains transforms or nested stacks)"
+                      aws cloudformation package \
+                        --template-file "$template" \
+                        --s3-bucket $ARTIFACTS_BUCKET \
+                        --s3-prefix "cloudformation-packages/$(date +%Y%m%d-%H%M%S)" \
+                        --output-template-file "packaged-templates/$template_name" \
+                        --force-upload
+                    else
+                      echo "Copying $template (no packaging needed)"
+                      cp "$template" "packaged-templates/$template_name"
+                    fi
+                  done
+                
+                # Assume cross-account role
+                - echo "Assuming cross-account deployment role..."
+                - |
+                  CROSS_ACCOUNT_ROLE_ARN="arn:aws:iam::${TARGET_ACCOUNT_ID}:role/${CROSS_ACCOUNT_ROLE_NAME}"
+                  echo "Role ARN: $CROSS_ACCOUNT_ROLE_ARN"
+                  
+                  TEMP_ROLE=$(aws sts assume-role \
+                    --role-arn $CROSS_ACCOUNT_ROLE_ARN \
+                    --role-session-name "CrossAccount-Infra-Deploy-$(date +%s)" \
+                    --external-id $EXTERNAL_ID \
+                    --duration-seconds 3600)
+                  
+                  export AWS_ACCESS_KEY_ID=$(echo $TEMP_ROLE | jq -r '.Credentials.AccessKeyId')
+                  export AWS_SECRET_ACCESS_KEY=$(echo $TEMP_ROLE | jq -r '.Credentials.SecretAccessKey')
+                  export AWS_SESSION_TOKEN=$(echo $TEMP_ROLE | jq -r '.Credentials.SessionToken')
+                
+                # Verify assumed role
+                - echo "Verifying assumed role identity..."
+                - aws sts get-caller-identity
+                
+                # Deploy infrastructure stacks
+                - echo "Deploying infrastructure stacks to target account..."
+                - |
+                  # Deploy VPC stack first (foundational)
+                  if [ -f "packaged-templates/vpc.yaml" ]; then
+                    echo "Deploying VPC infrastructure..."
+                    aws cloudformation deploy \
+                      --template-file packaged-templates/vpc.yaml \
+                      --stack-name CrossAccount-VPC-${ENVIRONMENT} \
+                      --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+                      --parameter-overrides \
+                        Environment=${ENVIRONMENT} \
+                        Project=CrossAccountInfraDeployment \
+                      --tags \
+                        Environment=${ENVIRONMENT} \
+                        Project=CrossAccountInfraDeployment \
+                        ManagedBy=CodePipeline \
+                        SourceAccount=${AWS_ACCOUNT_ID} \
+                      --no-fail-on-empty-changeset \
+                      --region $AWS_DEFAULT_REGION
+                  fi
+                
+                - |
+                  # Deploy Security Groups
+                  if [ -f "packaged-templates/security-groups.yaml" ]; then
+                    echo "Deploying Security Groups..."
+                    aws cloudformation deploy \
+                      --template-file packaged-templates/security-groups.yaml \
+                      --stack-name CrossAccount-SecurityGroups-${ENVIRONMENT} \
+                      --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+                      --parameter-overrides \
+                        Environment=${ENVIRONMENT} \
+                        Project=CrossAccountInfraDeployment \
+                      --tags \
+                        Environment=${ENVIRONMENT} \
+                        Project=CrossAccountInfraDeployment \
+                        ManagedBy=CodePipeline \
+                        SourceAccount=${AWS_ACCOUNT_ID} \
+                      --no-fail-on-empty-changeset \
+                      --region $AWS_DEFAULT_REGION
+                  fi
+                
+                - |
+                  # Deploy S3 buckets
+                  if [ -f "packaged-templates/s3-storage.yaml" ]; then
+                    echo "Deploying S3 storage..."
+                    aws cloudformation deploy \
+                      --template-file packaged-templates/s3-storage.yaml \
+                      --stack-name CrossAccount-S3Storage-${ENVIRONMENT} \
+                      --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+                      --parameter-overrides \
+                        Environment=${ENVIRONMENT} \
+                        Project=CrossAccountInfraDeployment \
+                      --tags \
+                        Environment=${ENVIRONMENT} \
+                        Project=CrossAccountInfraDeployment \
+                        ManagedBy=CodePipeline \
+                        SourceAccount=${AWS_ACCOUNT_ID} \
+                      --no-fail-on-empty-changeset \
+                      --region $AWS_DEFAULT_REGION
+                  fi
+                
+                - |
+                  # Deploy additional infrastructure templates
+                  for template in packaged-templates/*.yaml packaged-templates/*.yml; do
+                    if [ -f "$template" ]; then
+                      template_name=$(basename "$template" .yaml)
+                      template_name=$(basename "$template_name" .yml)
+                      
+                      # Skip already deployed templates
+                      case "$template_name" in
+                        vpc|security-groups|s3-storage)
+                          continue
+                          ;;
+                      esac
+                      
+                      echo "Deploying additional template: $template_name"
+                      stack_name="CrossAccount-${template_name^}-${ENVIRONMENT}"
+                      
+                      aws cloudformation deploy \
+                        --template-file "$template" \
+                        --stack-name "$stack_name" \
+                        --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+                        --parameter-overrides \
+                          Environment=${ENVIRONMENT} \
+                          Project=CrossAccountInfraDeployment \
+                        --tags \
+                          Environment=${ENVIRONMENT} \
+                          Project=CrossAccountInfraDeployment \
+                          ManagedBy=CodePipeline \
+                          SourceAccount=${AWS_ACCOUNT_ID} \
+                        --no-fail-on-empty-changeset \
+                        --region $AWS_DEFAULT_REGION
+                    fi
+                  done
+            
+            post_build:
+              commands:
+                - echo "=== POST-BUILD PHASE ==="
+                - echo "Deployment completed on $(date)"
+                
+                # List deployed stacks
+                - echo "Deployed stacks in target account:"
+                - |
+                  aws cloudformation list-stacks \
+                    --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE \
+                    --query 'StackSummaries[?contains(StackName, `CrossAccount`)].{Name:StackName,Status:StackStatus,Created:CreationTime}' \
+                    --output table
+                
+                # Get stack outputs
+                - echo "Stack outputs:"
+                - |
+                  aws cloudformation list-stacks \
+                    --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE \
+                    --query 'StackSummaries[?contains(StackName, `CrossAccount`)].StackName' \
+                    --output text | tr '\t' '\n' | while read stack; do
+                      echo "=== Outputs for $stack ==="
+                      aws cloudformation describe-stacks \
+                        --stack-name "$stack" \
+                        --query 'Stacks[0].Outputs' \
+                        --output table 2>/dev/null || echo "No outputs for $stack"
+                    done
+          
+          artifacts:
+            files:
+              - 'packaged-templates/**/*'
+            name: CrossAccountInfraDeploymentArtifacts
+      
+      TimeoutInMinutes: 60
+      Tags:
+        - Key: Purpose
+          Value: CrossAccountInfraDeployment
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CodePipeline service role
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'CrossAccount-CodePipeline-ServiceRole-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: CodePipelineServicePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # S3 permissions for artifacts
+              - Effect: Allow
+                Action:
+                  - 's3:GetBucketVersioning'
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                  - 's3:PutObject'
+                  - 's3:PutObjectAcl'
+                  - 's3:ListBucket'
+                Resource:
+                  - !Sub '${ArtifactsBucket}'
+                  - !Sub '${ArtifactsBucket}/*'
+              
+              # CodeBuild permissions
+              - Effect: Allow
+                Action:
+                  - 'codebuild:BatchGetBuilds'
+                  - 'codebuild:StartBuild'
+                Resource: !GetAtt CodeBuildProject.Arn
+              
+              # CloudWatch Logs permissions
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+
+  # CodePipeline
+  CrossAccountPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub 'cross-account-infra-pipeline-${Environment}'
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactsBucket
+      RestartExecutionOnUpdate: true
+      Stages:
+        # Source stage
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Provider: GitHub
+                Version: '1'
+              Configuration:
+                Owner: !Ref GitHubRepoOwner
+                Repo: !Ref GitHubRepoName
+                Branch: !Ref GitHubBranch
+                OAuthToken: !Ref GitHubToken
+                PollForSourceChanges: false
+              OutputArtifacts:
+                - Name: SourceOutput
+        
+        # Build and Deploy stage
+        - Name: BuildAndDeploy
+          Actions:
+            - Name: BuildAndDeployAction
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+      
+      Tags:
+        - Key: Purpose
+          Value: CrossAccountInfraDeployment
+        - Key: Environment
+          Value: !Ref Environment
+
+  # GitHub webhook for automatic triggering
+  GitHubWebhook:
+    Type: AWS::CodePipeline::Webhook
+    Properties:
+      Name: !Sub 'cross-account-infra-github-webhook-${Environment}'
+      Authentication: GITHUB_HMAC
+      AuthenticationConfiguration:
+        SecretToken: !Ref GitHubToken
+      Filters:
+        - JsonPath: '$.ref'
+          MatchEquals: !Sub 'refs/heads/${GitHubBranch}'
+      TargetPipeline: !Ref CrossAccountPipeline
+      TargetAction: SourceAction
+      TargetPipelineVersion: !GetAtt CrossAccountPipeline.Version
+      RegisterWithThirdParty: true
+
+Outputs:
+  PipelineName:
+    Description: 'Name of the CodePipeline'
+    Value: !Ref CrossAccountPipeline
+    Export:
+      Name: !Sub '${AWS::StackName}-PipelineName'
+  
+  PipelineUrl:
+    Description: 'URL of the CodePipeline in AWS Console'
+    Value: !Sub 'https://console.aws.amazon.com/codesuite/codepipeline/pipelines/${CrossAccountPipeline}/view?region=${AWS::Region}'
+  
+  ArtifactsBucketName:
+    Description: 'Name of the S3 artifacts bucket'
+    Value: !Ref ArtifactsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ArtifactsBucket'
+  
+  CodeBuildProjectName:
+    Description: 'Name of the CodeBuild project'
+    Value: !Ref CodeBuildProject
+    Export:
+      Name: !Sub '${AWS::StackName}-CodeBuildProject'
+  
+  CodeBuildProjectArn:
+    Description: 'ARN of the CodeBuild project'
+    Value: !GetAtt CodeBuildProject.Arn
+  
+  GitHubWebhookUrl:
+    Description: 'GitHub webhook URL'
+    Value: !GetAtt GitHubWebhook.Url

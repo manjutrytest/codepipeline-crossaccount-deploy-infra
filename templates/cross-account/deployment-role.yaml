@@ -1,0 +1,203 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Cross-account deployment role for CodePipeline infrastructure deployment'
+
+Parameters:
+  SourceAccountId:
+    Type: String
+    Description: 'AWS Account ID of the source account (where CodePipeline runs)'
+    AllowedPattern: '[0-9]{12}'
+    ConstraintDescription: 'Must be a valid 12-digit AWS Account ID'
+    
+  RoleName:
+    Type: String
+    Default: 'CrossAccountInfraDeploymentRole'
+    Description: 'Name of the cross-account deployment role'
+    
+  ExternalId:
+    Type: String
+    Default: 'cross-account-infra-deploy-2024'
+    Description: 'External ID for additional security'
+    NoEcho: true
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Cross-Account Configuration"
+        Parameters:
+          - SourceAccountId
+          - RoleName
+          - ExternalId
+
+Resources:
+  # Cross-account deployment role
+  CrossAccountDeploymentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref RoleName
+      Description: 'Role for cross-account infrastructure deployment via CodePipeline'
+      MaxSessionDuration: 14400  # 4 hours
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Allow source account root to assume this role
+          - Sid: AllowSourceAccountAssumption
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${SourceAccountId}:root'
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Ref ExternalId
+          # Allow CodeBuild service from source account
+          - Sid: AllowCodeBuildServiceAssumption
+            Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref SourceAccountId
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/PowerUserAccess'
+      Policies:
+        # CloudFormation deployment permissions
+        - PolicyName: CloudFormationDeploymentPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # CloudFormation permissions
+              - Sid: CloudFormationFullAccess
+                Effect: Allow
+                Action:
+                  - 'cloudformation:*'
+                Resource: '*'
+              
+              # IAM permissions for CloudFormation
+              - Sid: IAMPermissionsForCloudFormation
+                Effect: Allow
+                Action:
+                  - 'iam:CreateRole'
+                  - 'iam:DeleteRole'
+                  - 'iam:GetRole'
+                  - 'iam:UpdateRole'
+                  - 'iam:PassRole'
+                  - 'iam:AttachRolePolicy'
+                  - 'iam:DetachRolePolicy'
+                  - 'iam:PutRolePolicy'
+                  - 'iam:DeleteRolePolicy'
+                  - 'iam:GetRolePolicy'
+                  - 'iam:ListRolePolicies'
+                  - 'iam:ListAttachedRolePolicies'
+                  - 'iam:CreateInstanceProfile'
+                  - 'iam:DeleteInstanceProfile'
+                  - 'iam:GetInstanceProfile'
+                  - 'iam:AddRoleToInstanceProfile'
+                  - 'iam:RemoveRoleFromInstanceProfile'
+                  - 'iam:CreatePolicy'
+                  - 'iam:DeletePolicy'
+                  - 'iam:GetPolicy'
+                  - 'iam:GetPolicyVersion'
+                  - 'iam:ListPolicyVersions'
+                  - 'iam:CreatePolicyVersion'
+                  - 'iam:DeletePolicyVersion'
+                  - 'iam:SetDefaultPolicyVersion'
+                  - 'iam:TagRole'
+                  - 'iam:UntagRole'
+                  - 'iam:TagPolicy'
+                  - 'iam:UntagPolicy'
+                  - 'iam:TagInstanceProfile'
+                  - 'iam:UntagInstanceProfile'
+                Resource: '*'
+              
+              # S3 permissions
+              - Sid: S3FullAccess
+                Effect: Allow
+                Action:
+                  - 's3:*'
+                Resource: '*'
+              
+              # EC2 and VPC permissions
+              - Sid: EC2VPCFullAccess
+                Effect: Allow
+                Action:
+                  - 'ec2:*'
+                Resource: '*'
+              
+              # Additional AWS services permissions
+              - Sid: AdditionalServicesAccess
+                Effect: Allow
+                Action:
+                  - 'logs:*'
+                  - 'ssm:*'
+                  - 'kms:*'
+                  - 'lambda:*'
+                  - 'events:*'
+                  - 'sns:*'
+                  - 'sqs:*'
+                  - 'elasticache:*'
+                  - 'rds:*'
+                  - 'elasticloadbalancing:*'
+                  - 'autoscaling:*'
+                  - 'application-autoscaling:*'
+                  - 'route53:*'
+                  - 'acm:*'
+                  - 'waf:*'
+                  - 'wafv2:*'
+                  - 'shield:*'
+                  - 'guardduty:*'
+                  - 'config:*'
+                  - 'cloudtrail:*'
+                  - 'cloudwatch:*'
+                Resource: '*'
+
+      Tags:
+        - Key: Purpose
+          Value: CrossAccountDeployment
+        - Key: SourceAccount
+          Value: !Ref SourceAccountId
+        - Key: Environment
+          Value: Production
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Project
+          Value: CrossAccountInfraDeployment
+
+  # CloudWatch Log Group for deployment activities
+  DeploymentLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/cross-account-deployment/${RoleName}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Purpose
+          Value: CrossAccountDeploymentLogs
+        - Key: Environment
+          Value: Production
+
+Outputs:
+  CrossAccountRoleArn:
+    Description: 'ARN of the cross-account deployment role'
+    Value: !GetAtt CrossAccountDeploymentRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CrossAccountRoleArn'
+  
+  CrossAccountRoleName:
+    Description: 'Name of the cross-account deployment role'
+    Value: !Ref CrossAccountDeploymentRole
+    Export:
+      Name: !Sub '${AWS::StackName}-CrossAccountRoleName'
+  
+  TrustPolicyInfo:
+    Description: 'Trust policy information for the cross-account role'
+    Value: !Sub 'Allows assumption from account ${SourceAccountId} with external ID'
+  
+  DeploymentLogGroupName:
+    Description: 'CloudWatch Log Group for deployment activities'
+    Value: !Ref DeploymentLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-DeploymentLogGroup'
+  
+  ExternalIdUsed:
+    Description: 'External ID used for role assumption (for reference)'
+    Value: !Ref ExternalId
